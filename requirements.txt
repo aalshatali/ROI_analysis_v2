@@ -6,4 +6,9 @@ scipy>=1.13.0
 scikit-image>=0.23.0
 SimpleITK>=2.3.0
 matplotlib>=3.8.0
- 
+
+# DICOM compressed transfer syntax decoders
+# (required for JPEG, JPEG-LS, JPEG2000 encoded DICOM files)
+pylibjpeg>=2.0.0
+pylibjpeg-libjpeg>=2.1.0
+pylibjpeg-openjpeg>=2.1.0
