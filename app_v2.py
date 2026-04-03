@@ -330,11 +330,19 @@ def load_ct_volume(files: tuple[str, ...]):
     spacing = (row_sp, col_sp, slice_sp)
     origin = np.array([float(v) for v in slices[0].ImagePositionPatient])
 
-    return volume, slices, z_positions, spacing, origin
+    # ImageOrientationPatient: [row_cosine(3), col_cosine(3)]
+    iop = [float(v) for v in slices[0].ImageOrientationPatient]
+    row_cosine   = np.array(iop[:3])
+    col_cosine   = np.array(iop[3:])
+    slice_cosine = np.cross(row_cosine, col_cosine)
+    # SimpleITK direction: column-major (row_cos | col_cos | slice_cos)
+    direction = tuple(row_cosine) + tuple(col_cosine) + tuple(slice_cosine)
+
+    return volume, slices, z_positions, spacing, origin, direction
 
 
 def build_roi_mask(rt_path: str, roi_name: str, volume_shape, z_positions, spacing, origin,
-                   z_tol: float = 1.0) -> np.ndarray:
+                   z_tol: float = 3.0) -> np.ndarray:
     """Convert RTSTRUCT contours → boolean voxel mask."""
     rt = pydicom.dcmread(rt_path)
     roi_map = {r.ROIName: r.ROINumber for r in rt.StructureSetROISequence}
@@ -395,12 +403,27 @@ def erode_mask(mask: np.ndarray, n: int) -> np.ndarray:
     return eroded
 
 
-def volume_to_sitk(volume: np.ndarray, spacing: tuple, origin: np.ndarray) -> sitk.Image:
-    """Convert numpy HU volume (rows, cols, slices) → SimpleITK image."""
-    # SimpleITK uses (x, y, z) = (cols, rows, slices)
+def volume_to_sitk(
+    volume: np.ndarray,
+    spacing: tuple,
+    origin: np.ndarray,
+    direction: tuple | None = None,
+) -> sitk.Image:
+    """
+    Convert numpy HU volume (rows, cols, slices) -> SimpleITK image.
+
+    SimpleITK axis order is (x=cols, y=rows, z=slices), so the array is
+    transposed to (slices, rows, cols) before wrapping.
+    Spacing  -> (col_sp, row_sp, slice_sp)
+    Direction cosines from DICOM ImageOrientationPatient MUST be set;
+    without them SimpleITK assumes an identity direction matrix and two
+    physically-overlapping grids can appear non-overlapping to the resampler.
+    """
     img = sitk.GetImageFromArray(np.transpose(volume, (2, 0, 1)).astype(np.float32))
-    img.SetSpacing((spacing[1], spacing[0], spacing[2]))  # (col_sp, row_sp, slice_sp)
+    img.SetSpacing((float(spacing[1]), float(spacing[0]), float(spacing[2])))
     img.SetOrigin(tuple(float(v) for v in origin))
+    if direction is not None:
+        img.SetDirection(direction)
     return img
 
 
@@ -527,20 +550,20 @@ if zip_ct and zip_pcct:
 
         # ── Load CT volume ──
         with st.spinner("Loading CT volume…"):
-            ct_vol, ct_slices, ct_z, ct_spacing, ct_origin = load_ct_volume(
+            ct_vol, ct_slices, ct_z, ct_spacing, ct_origin, ct_direction = load_ct_volume(
                 tuple(sorted(ct_files))
             )
 
         # ── Load PCCT volume ──
         with st.spinner("Loading PCCT volume…"):
-            pcct_vol, pcct_slices, pcct_z, pcct_spacing, pcct_origin = load_ct_volume(
+            pcct_vol, pcct_slices, pcct_z, pcct_spacing, pcct_origin, pcct_direction = load_ct_volume(
                 tuple(sorted(pcct_files))
             )
 
         # ── Resample PCCT onto CT grid ──
         with st.spinner("Resampling PCCT onto CT grid…"):
-            ct_sitk = volume_to_sitk(ct_vol, ct_spacing, ct_origin)
-            pcct_sitk = volume_to_sitk(pcct_vol, pcct_spacing, pcct_origin)
+            ct_sitk = volume_to_sitk(ct_vol, ct_spacing, ct_origin, ct_direction)
+            pcct_sitk = volume_to_sitk(pcct_vol, pcct_spacing, pcct_origin, pcct_direction)
             pcct_resampled_sitk = resample_to_reference(pcct_sitk, ct_sitk)
             pcct_vol_r = sitk_to_numpy(pcct_resampled_sitk)
 
@@ -552,11 +575,13 @@ if zip_ct and zip_pcct:
                                            pcct_z, pcct_spacing, pcct_origin)
 
             # Resample PCCT mask onto CT grid using SimpleITK (nearest neighbour)
-            pcct_mask_sitk = sitk.GetImageFromArray(
-                np.transpose(mask_pcct_raw.astype(np.uint8), (2, 0, 1))
+            # Use volume_to_sitk so spacing, origin AND direction are set consistently
+            pcct_mask_sitk = volume_to_sitk(
+                mask_pcct_raw.astype(np.float32),
+                pcct_spacing,
+                pcct_origin,
+                pcct_direction,
             )
-            pcct_mask_sitk.SetSpacing((pcct_spacing[1], pcct_spacing[0], pcct_spacing[2]))
-            pcct_mask_sitk.SetOrigin(tuple(float(v) for v in pcct_origin))
 
             resampler_nn = sitk.ResampleImageFilter()
             resampler_nn.SetReferenceImage(ct_sitk)
@@ -583,6 +608,22 @@ if zip_ct and zip_pcct:
                     f"| Intersection (CT ∩ PCCT) | `{n_intersection:,}` |\n"
                     f"| After {erosion_voxels}-voxel 2D erosion | computed below |"
                 )
+                st.markdown("**CT grid**")
+                st.code(
+                    f"origin : {[round(v,2) for v in ct_origin]}\n"
+                    f"spacing: {[round(v,4) for v in ct_spacing]}\n"
+                    f"shape  : {ct_vol.shape}\n"
+                    f"direction: {[round(v,4) for v in ct_direction]}"
+                )
+                st.markdown("**PCCT grid (before resampling)**")
+                st.code(
+                    f"origin : {[round(v,2) for v in pcct_origin]}\n"
+                    f"spacing: {[round(v,4) for v in pcct_spacing]}\n"
+                    f"shape  : {pcct_vol.shape}\n"
+                    f"direction: {[round(v,4) for v in pcct_direction]}"
+                )
+                st.markdown("**PCCT mask raw voxels (before resampling)**")
+                st.code(f"n_voxels in PCCT native grid: {int(mask_pcct_raw.sum()):,}")
                 if n_ct_mask == 0:
                     st.error("CT mask is empty — check RTSTRUCT and ROI name.")
                 if n_pcct_mask == 0:
