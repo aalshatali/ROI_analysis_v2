@@ -372,11 +372,27 @@ def build_roi_mask(rt_path: str, roi_name: str, volume_shape, z_positions, spaci
 
 
 def erode_mask(mask: np.ndarray, n: int) -> np.ndarray:
-    """Erode a 3D boolean mask by n voxels using a spherical-ish structuring element."""
+    """
+    Erode a 3D boolean mask slice-by-slice (2D erosion per slice).
+
+    Why 2D and not 3D:
+      - CT slice thickness (e.g. 1–3 mm) is typically much larger than
+        in-plane pixel spacing (e.g. 0.5–1 mm), so a 3D cube structuring
+        element aggressively removes voxels through-plane and can wipe
+        out thin ROIs entirely.
+      - 2D erosion per slice is standard practice in radiomics for this
+        reason and correctly reflects the in-plane boundary uncertainty.
+    """
     if n == 0:
         return mask
-    struct = np.ones((2 * n + 1, 2 * n + 1, 2 * n + 1), dtype=bool)
-    return binary_erosion(mask, structure=struct, iterations=1)
+    struct_2d = np.ones((2 * n + 1, 2 * n + 1), dtype=bool)
+    eroded = np.zeros_like(mask)
+    for sl in range(mask.shape[2]):
+        if mask[:, :, sl].any():
+            eroded[:, :, sl] = binary_erosion(
+                mask[:, :, sl], structure=struct_2d
+            )
+    return eroded
 
 
 def volume_to_sitk(volume: np.ndarray, spacing: tuple, origin: np.ndarray) -> sitk.Image:
@@ -552,15 +568,59 @@ if zip_ct and zip_pcct:
                 sitk.Cast(pcct_mask_r_sitk, sitk.sitkUInt8)
             ).astype(bool)
 
+            # ── Diagnostics: show voxel counts at each step ──
+            n_ct_mask   = int(mask_ct.sum())
+            n_pcct_mask = int(mask_pcct_r.sum())
+
+            combined_mask_pre = mask_ct & mask_pcct_r
+            n_intersection = int(combined_mask_pre.sum())
+
+            with st.expander("🔍 Mask diagnostics (expand to debug)", expanded=False):
+                st.markdown(
+                    f"| Step | Voxels |\n|---|---|\n"
+                    f"| CT mask (on CT grid) | `{n_ct_mask:,}` |\n"
+                    f"| PCCT mask (resampled onto CT grid) | `{n_pcct_mask:,}` |\n"
+                    f"| Intersection (CT ∩ PCCT) | `{n_intersection:,}` |\n"
+                    f"| After {erosion_voxels}-voxel 2D erosion | computed below |"
+                )
+                if n_ct_mask == 0:
+                    st.error("CT mask is empty — check RTSTRUCT and ROI name.")
+                if n_pcct_mask == 0:
+                    st.error(
+                        "PCCT mask resampled onto CT grid is empty. "
+                        "This usually means the PCCT image origin/spacing metadata "
+                        "does not overlap with the CT grid. "
+                        "Verify that registration was applied and saved into the DICOM headers."
+                    )
+                if n_intersection == 0 and n_ct_mask > 0 and n_pcct_mask > 0:
+                    st.error(
+                        "CT and PCCT masks do not overlap after resampling. "
+                        "The two scans may cover different anatomical regions, "
+                        "or the RTSTRUCT Z positions do not align."
+                    )
+
+            if n_intersection == 0:
+                st.error(
+                    "❌ CT and PCCT masks have zero overlap — cannot proceed. "
+                    "Expand 'Mask diagnostics' above for details."
+                )
+                st.stop()
+
             # Combined mask: intersection of both, then erode
-            combined_mask = mask_ct & mask_pcct_r
             if erosion_voxels > 0:
-                combined_mask = erode_mask(combined_mask, erosion_voxels)
+                combined_mask = erode_mask(combined_mask_pre, erosion_voxels)
+            else:
+                combined_mask = combined_mask_pre
 
             n_voxels = int(combined_mask.sum())
 
         if n_voxels == 0:
-            st.error("❌ Mask is empty after erosion. Try reducing erosion voxels.")
+            st.error(
+                f"❌ Mask is empty after {erosion_voxels}-voxel erosion "
+                f"(intersection had {n_intersection:,} voxels before erosion). "
+                "Try reducing the erosion value in the sidebar — the ROI may be "
+                "too thin in-plane for the current setting."
+            )
             st.stop()
 
         # ── Extract HU values ──
