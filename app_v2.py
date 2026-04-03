@@ -221,6 +221,36 @@ div[data-testid="stAlert"] p {
     font-size: 0.72rem;
     margin: 2px;
 }
+
+/* ── Selectbox / dropdown — light background needs dark text ── */
+div[data-baseweb="select"] span,
+div[data-baseweb="select"] div,
+div[data-baseweb="select"] input,
+div[data-baseweb="select"] > div > div {
+    color: #0d1117 !important;
+    background-color: #f0f2f6 !important;
+}
+ul[data-baseweb="menu"] li,
+ul[data-baseweb="menu"] span,
+[role="listbox"] li,
+[role="option"] {
+    color: #0d1117 !important;
+    background-color: #ffffff !important;
+}
+[role="option"]:hover,
+[role="option"][aria-selected="true"] {
+    background-color: #dde1e7 !important;
+    color: #0d1117 !important;
+}
+/* Number / text inputs */
+input[type="number"], input[type="text"] {
+    color: #0d1117 !important;
+    background-color: #f0f2f6 !important;
+}
+/* Radio button labels (already light enough, but ensure contrast) */
+.stRadio > div label p {
+    color: #e6edf3 !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -693,90 +723,153 @@ if zip_ct and zip_pcct:
                 tuple(sorted(pcct_files))
             )
 
-        # ── Resample PCCT onto CT grid ──
-        with st.spinner("Resampling PCCT onto CT grid…"):
-            ct_sitk = volume_to_sitk(ct_vol, ct_spacing, ct_origin, ct_direction)
-            pcct_sitk = volume_to_sitk(pcct_vol, pcct_spacing, pcct_origin, pcct_direction)
-            pcct_resampled_sitk = resample_to_reference(pcct_sitk, ct_sitk)
-            pcct_vol_r = sitk_to_numpy(pcct_resampled_sitk)
+        # ── Align PCCT volume to CT grid (index-space) ──
+        # Background: registration guarantees anatomy is aligned, but DICOM
+        # ImagePositionPatient Z origins can differ by hundreds of mm when the
+        # registration transform was NOT written back into the CT headers.
+        # Physical-space resampling therefore fails.  We instead align the two
+        # volumes slice-by-rank: we identify which PCCT slices spatially
+        # correspond to which CT slices by matching their ranked contour Z
+        # positions, then resample PCCT in-plane only onto the CT pixel grid.
+        with st.spinner("Aligning PCCT onto CT grid (index-space)…"):
 
-        # ── Build masks on CT grid ──
-        with st.spinner("Building ROI masks…"):
-            mask_ct = build_roi_mask(ct_rt, selected_roi, ct_vol.shape,
-                                     ct_z, ct_spacing, ct_origin)
-            mask_pcct_raw = build_roi_mask(pcct_rt, selected_roi, pcct_vol.shape,
-                                           pcct_z, pcct_spacing, pcct_origin)
+            # 1. Build masks in each scanner's own native pixel space
+            mask_ct   = build_roi_mask(ct_rt,   selected_roi, ct_vol.shape,
+                                       ct_z,   ct_spacing,   ct_origin)
+            mask_pcct = build_roi_mask(pcct_rt, selected_roi, pcct_vol.shape,
+                                       pcct_z, pcct_spacing, pcct_origin)
 
-            # Resample PCCT mask onto CT grid using SimpleITK (nearest neighbour)
-            # Use volume_to_sitk so spacing, origin AND direction are set consistently
-            pcct_mask_sitk = volume_to_sitk(
-                mask_pcct_raw.astype(np.float32),
-                pcct_spacing,
-                pcct_origin,
-                pcct_direction,
+            # 2. Find which slice indices have ROI voxels in each mask
+            ct_roi_slices   = sorted(np.unique(np.where(mask_ct)[2]))
+            pcct_roi_slices = sorted(np.unique(np.where(mask_pcct)[2]))
+
+            n_ct_mask_raw   = int(mask_ct.sum())
+            n_pcct_mask_raw = int(mask_pcct.sum())
+
+            # 3. Match PCCT ROI slices to CT ROI slices by rank order.
+            #    Registration guarantees the Nth ROI slice in PCCT corresponds
+            #    to the Nth ROI slice in CT, regardless of Z coordinates.
+            n_common = min(len(ct_roi_slices), len(pcct_roi_slices))
+            slice_pairs = list(zip(ct_roi_slices[:n_common],
+                                   pcct_roi_slices[:n_common]))
+
+            # 4. For each pair, resample the PCCT slice in-plane onto CT grid
+            #    using SimpleITK (handles different pixel spacings correctly).
+            ct_rows,   ct_cols   = ct_vol.shape[:2]
+            pcct_rows, pcct_cols = pcct_vol.shape[:2]
+            needs_inplane_resample = (
+                ct_rows != pcct_rows or ct_cols != pcct_cols or
+                abs(ct_spacing[0] - pcct_spacing[0]) > 0.001 or
+                abs(ct_spacing[1] - pcct_spacing[1]) > 0.001
             )
 
-            resampler_nn = sitk.ResampleImageFilter()
-            resampler_nn.SetReferenceImage(ct_sitk)
-            resampler_nn.SetInterpolator(sitk.sitkNearestNeighbor)
-            resampler_nn.SetTransform(sitk.Transform())
-            resampler_nn.SetDefaultPixelValue(0)
-            pcct_mask_r_sitk = resampler_nn.Execute(pcct_mask_sitk)
-            mask_pcct_r = sitk_to_numpy(
-                sitk.Cast(pcct_mask_r_sitk, sitk.sitkUInt8)
-            ).astype(bool)
+            # Allocate resampled PCCT volume on CT grid
+            pcct_vol_r = np.full(ct_vol.shape, -1024.0, dtype=np.float32)
+            mask_pcct_r = np.zeros(ct_vol.shape, dtype=bool)
 
-            # ── Diagnostics: show voxel counts at each step ──
+            for ct_sl, pcct_sl in slice_pairs:
+                if needs_inplane_resample:
+                    # Wrap single PCCT slice as a 2D SimpleITK image
+                    pcct_slice_sitk = sitk.GetImageFromArray(
+                        pcct_vol[:, :, pcct_sl].astype(np.float32)
+                    )
+                    pcct_slice_sitk.SetSpacing(
+                        (float(pcct_spacing[1]), float(pcct_spacing[0]))
+                    )
+                    pcct_slice_sitk.SetOrigin(
+                        (float(pcct_origin[0]), float(pcct_origin[1]))
+                    )
+                    # Reference CT slice grid
+                    ct_ref_sitk = sitk.GetImageFromArray(
+                        ct_vol[:, :, ct_sl].astype(np.float32)
+                    )
+                    ct_ref_sitk.SetSpacing(
+                        (float(ct_spacing[1]), float(ct_spacing[0]))
+                    )
+                    ct_ref_sitk.SetOrigin(
+                        (float(ct_origin[0]), float(ct_origin[1]))
+                    )
+                    resampler_2d = sitk.ResampleImageFilter()
+                    resampler_2d.SetReferenceImage(ct_ref_sitk)
+                    resampler_2d.SetInterpolator(sitk.sitkLinear)
+                    resampler_2d.SetTransform(sitk.Transform(2, sitk.sitkIdentity))
+                    resampler_2d.SetDefaultPixelValue(-1024.0)
+                    pcct_resampled_2d = sitk.GetArrayFromImage(
+                        resampler_2d.Execute(pcct_slice_sitk)
+                    )
+                    pcct_vol_r[:, :, ct_sl] = pcct_resampled_2d
+
+                    # Resample PCCT mask slice
+                    pcct_mask_sitk_2d = sitk.GetImageFromArray(
+                        mask_pcct[:, :, pcct_sl].astype(np.float32)
+                    )
+                    pcct_mask_sitk_2d.SetSpacing(
+                        (float(pcct_spacing[1]), float(pcct_spacing[0]))
+                    )
+                    pcct_mask_sitk_2d.SetOrigin(
+                        (float(pcct_origin[0]), float(pcct_origin[1]))
+                    )
+                    resampler_nn2d = sitk.ResampleImageFilter()
+                    resampler_nn2d.SetReferenceImage(ct_ref_sitk)
+                    resampler_nn2d.SetInterpolator(sitk.sitkNearestNeighbor)
+                    resampler_nn2d.SetTransform(sitk.Transform(2, sitk.sitkIdentity))
+                    resampler_nn2d.SetDefaultPixelValue(0)
+                    mask_pcct_r[:, :, ct_sl] = sitk.GetArrayFromImage(
+                        resampler_nn2d.Execute(pcct_mask_sitk_2d)
+                    ).astype(bool)
+                else:
+                    # Same grid — just copy
+                    pcct_vol_r[:, :, ct_sl]  = pcct_vol[:, :, pcct_sl]
+                    mask_pcct_r[:, :, ct_sl] = mask_pcct[:, :, pcct_sl]
+
+            # 5. Diagnostics
             n_ct_mask   = int(mask_ct.sum())
             n_pcct_mask = int(mask_pcct_r.sum())
-
             combined_mask_pre = mask_ct & mask_pcct_r
             n_intersection = int(combined_mask_pre.sum())
 
             with st.expander("🔍 Mask diagnostics (expand to debug)", expanded=False):
                 st.markdown(
                     f"| Step | Voxels |\n|---|---|\n"
-                    f"| CT mask (on CT grid) | `{n_ct_mask:,}` |\n"
-                    f"| PCCT mask (resampled onto CT grid) | `{n_pcct_mask:,}` |\n"
+                    f"| CT mask (native grid) | `{n_ct_mask:,}` |\n"
+                    f"| PCCT mask (aligned to CT grid) | `{n_pcct_mask:,}` |\n"
                     f"| Intersection (CT ∩ PCCT) | `{n_intersection:,}` |\n"
                     f"| After {erosion_voxels}-voxel 2D erosion | computed below |"
                 )
                 st.markdown("**CT grid**")
                 st.code(
-                    f"origin : {[round(v,2) for v in ct_origin]}\n"
-                    f"spacing: {[round(v,4) for v in ct_spacing]}\n"
-                    f"shape  : {ct_vol.shape}\n"
-                    f"direction: {[round(v,4) for v in ct_direction]}"
+                    f"origin  : {[round(v,2) for v in ct_origin]}\n"
+                    f"spacing : {[round(v,4) for v in ct_spacing]}\n"
+                    f"shape   : {ct_vol.shape}\n"
+                    f"roi slices ({len(ct_roi_slices)}): {ct_roi_slices}"
                 )
-                st.markdown("**PCCT grid (before resampling)**")
+                st.markdown("**PCCT grid (native)**")
                 st.code(
-                    f"origin : {[round(v,2) for v in pcct_origin]}\n"
-                    f"spacing: {[round(v,4) for v in pcct_spacing]}\n"
-                    f"shape  : {pcct_vol.shape}\n"
-                    f"direction: {[round(v,4) for v in pcct_direction]}"
+                    f"origin  : {[round(v,2) for v in pcct_origin]}\n"
+                    f"spacing : {[round(v,4) for v in pcct_spacing]}\n"
+                    f"shape   : {pcct_vol.shape}\n"
+                    f"roi slices ({len(pcct_roi_slices)}): {pcct_roi_slices}"
                 )
-                st.markdown("**PCCT mask raw voxels (before resampling)**")
-                st.code(f"n_voxels in PCCT native grid: {int(mask_pcct_raw.sum()):,}")
+                st.markdown("**Slice pairing (CT slice → PCCT slice)**")
+                st.code("\n".join(f"CT sl {c:3d}  ←→  PCCT sl {p:3d}" for c, p in slice_pairs))
+                st.markdown(
+                    f"In-plane resample needed: `{needs_inplane_resample}` "
+                    f"(CT spacing {ct_spacing[:2]}, PCCT spacing {pcct_spacing[:2]})"
+                )
                 if n_ct_mask == 0:
                     st.error("CT mask is empty — check RTSTRUCT and ROI name.")
-                if n_pcct_mask == 0:
+                if n_pcct_mask_raw == 0:
+                    st.error("PCCT mask is empty in its native grid — check RTSTRUCT.")
+                if len(slice_pairs) == 0:
                     st.error(
-                        "PCCT mask resampled onto CT grid is empty. "
-                        "This usually means the PCCT image origin/spacing metadata "
-                        "does not overlap with the CT grid. "
-                        "Verify that registration was applied and saved into the DICOM headers."
-                    )
-                if n_intersection == 0 and n_ct_mask > 0 and n_pcct_mask > 0:
-                    st.error(
-                        "CT and PCCT masks do not overlap after resampling. "
-                        "The two scans may cover different anatomical regions, "
-                        "or the RTSTRUCT Z positions do not align."
+                        "No slice pairs found. Neither mask has any ROI voxels. "
+                        "Check that the selected ROI has contours in both RTSTRUCTs."
                     )
 
             if n_intersection == 0:
                 st.error(
-                    "❌ CT and PCCT masks have zero overlap — cannot proceed. "
-                    "Expand 'Mask diagnostics' above for details."
+                    "❌ CT and PCCT masks have zero overlap after index-space alignment.\n"
+                    "Expand 'Mask diagnostics' above to inspect slice pairing."
                 )
                 st.stop()
 
