@@ -52,39 +52,103 @@ html, body, [class*="css"] {
     font-family: 'Sora', sans-serif;
 }
 
-/* Dark background */
+/* ── Base text: always light on dark ── */
 .stApp {
     background-color: #0d1117;
     color: #e6edf3;
 }
 
+/* All plain paragraph / label text */
+p, span, div, label, li,
+.stMarkdown, .stText,
+[data-testid="stMarkdownContainer"] p {
+    color: #e6edf3 !important;
+}
+
 /* Sidebar */
 section[data-testid="stSidebar"] {
     background-color: #161b22;
-    border-right: 1px solid #21262d;
+    border-right: 1px solid #30363d;
+}
+section[data-testid="stSidebar"] p,
+section[data-testid="stSidebar"] span,
+section[data-testid="stSidebar"] label,
+section[data-testid="stSidebar"] div {
+    color: #e6edf3 !important;
 }
 
-/* Title area */
+/* Headings */
 h1 {
     font-family: 'Sora', sans-serif;
     font-weight: 700;
     font-size: 1.8rem;
     letter-spacing: -0.03em;
-    color: #e6edf3;
+    color: #e6edf3 !important;
 }
-
-h2, h3 {
+h2, h3, h4 {
     font-family: 'Sora', sans-serif;
     font-weight: 600;
-    color: #c9d1d9;
+    color: #c9d1d9 !important;
     letter-spacing: -0.02em;
 }
 
-/* Scanner label badges */
+/* Streamlit native widgets — inputs, selects, number inputs */
+.stSelectbox label, .stMultiSelect label,
+.stNumberInput label, .stRadio label,
+.stFileUploader label, .stSlider label {
+    color: #c9d1d9 !important;
+    font-size: 0.85rem;
+}
+.stRadio div[role="radiogroup"] label {
+    color: #e6edf3 !important;
+}
+
+/* Expander header text */
+.streamlit-expanderHeader {
+    color: #e6edf3 !important;
+    background-color: #161b22 !important;
+}
+.streamlit-expanderContent {
+    background-color: #0d1117 !important;
+    border: 1px solid #30363d;
+}
+
+/* st.code / st.text blocks */
+.stCodeBlock pre, code {
+    background-color: #161b22 !important;
+    color: #e6edf3 !important;
+    border: 1px solid #30363d;
+}
+
+/* Dataframe / table text */
+[data-testid="stDataFrame"] {
+    color: #e6edf3;
+}
+
+/* Alert / info / warning / error boxes */
+.stAlert {
+    color: #e6edf3 !important;
+}
+div[data-testid="stAlert"] p {
+    color: #e6edf3 !important;
+}
+
+/* Upload area */
+[data-testid="stFileUploader"] {
+    background-color: #161b22;
+    border: 1px dashed #30363d;
+    border-radius: 6px;
+}
+[data-testid="stFileUploader"] span,
+[data-testid="stFileUploader"] p {
+    color: #c9d1d9 !important;
+}
+
+/* ── Custom components ── */
 .badge-ct {
     display: inline-block;
     background: #0d4f8c;
-    color: #79c0ff;
+    color: #79c0ff !important;
     border: 1px solid #1f6feb;
     border-radius: 4px;
     padding: 2px 10px;
@@ -98,7 +162,7 @@ h2, h3 {
 .badge-pcct {
     display: inline-block;
     background: #3d1f63;
-    color: #d2a8ff;
+    color: #d2a8ff !important;
     border: 1px solid #8957e5;
     border-radius: 4px;
     padding: 2px 10px;
@@ -109,10 +173,9 @@ h2, h3 {
     margin-bottom: 8px;
 }
 
-/* Metric cards */
 .metric-card {
     background: #161b22;
-    border: 1px solid #21262d;
+    border: 1px solid #30363d;
     border-radius: 8px;
     padding: 16px 20px;
     margin: 6px 0;
@@ -121,7 +184,7 @@ h2, h3 {
 .metric-label {
     font-family: 'DM Mono', monospace;
     font-size: 0.7rem;
-    color: #8b949e;
+    color: #8b949e !important;
     letter-spacing: 0.1em;
     text-transform: uppercase;
     margin-bottom: 4px;
@@ -131,28 +194,25 @@ h2, h3 {
     font-family: 'DM Mono', monospace;
     font-size: 1.4rem;
     font-weight: 500;
-    color: #e6edf3;
+    color: #e6edf3 !important;
 }
 
-/* Section divider */
 .section-rule {
     border: none;
-    border-top: 1px solid #21262d;
+    border-top: 1px solid #30363d;
     margin: 2rem 0 1.5rem 0;
 }
 
-/* Info box */
 .info-box {
     background: #0d2137;
     border-left: 3px solid #1f6feb;
     border-radius: 0 6px 6px 0;
     padding: 12px 16px;
     font-size: 0.85rem;
-    color: #8b949e;
+    color: #c9d1d9 !important;
     margin: 12px 0;
 }
 
-/* Stratum chip */
 .stratum-chip {
     display: inline-block;
     border-radius: 20px;
@@ -303,22 +363,95 @@ def scan_dicom_dir(extract_dir: str):
     return ct_files, rt_file, roi_names
 
 
+def _decode_pixel_array(ds) -> np.ndarray:
+    """
+    Decode pixel data from a pydicom Dataset, handling both uncompressed
+    and compressed transfer syntaxes (JPEG, JPEG-LS, JPEG2000).
+
+    Compressed DICOM requires optional codec plugins:
+      pip install pylibjpeg pylibjpeg-libjpeg pylibjpeg-openjpeg gdcm
+
+    If all decoders fail the slice is skipped (caller handles missing slices).
+    """
+    # 1. Standard path — works for uncompressed and most JPEG variants
+    #    when the right plugin is installed.
+    try:
+        return ds.pixel_array.astype(np.float32)
+    except Exception:
+        pass
+
+    # 2. Force numpy handler (uncompressed fallback via raw buffer)
+    try:
+        import pydicom.pixel_data_handlers.numpy_handler as np_handler
+        if np_handler.supports_transfer_syntax(ds.file_meta.TransferSyntaxUID):
+            ds.decompress()
+            return ds.pixel_array.astype(np.float32)
+    except Exception:
+        pass
+
+    # 3. gdcm handler
+    try:
+        import pydicom.pixel_data_handlers.gdcm_handler as gdcm_handler
+        if gdcm_handler.supports_transfer_syntax(ds.file_meta.TransferSyntaxUID):
+            gdcm_handler.needs_to_convert_these_transfer_syntaxes(ds.file_meta.TransferSyntaxUID)
+            ds.decompress()
+            return ds.pixel_array.astype(np.float32)
+    except Exception:
+        pass
+
+    # 4. pylibjpeg handler
+    try:
+        import pydicom.pixel_data_handlers.pylibjpeg_handler as pljpeg
+        if pljpeg.supports_transfer_syntax(ds.file_meta.TransferSyntaxUID):
+            return pljpeg.get_pixeldata(ds).astype(np.float32).reshape(
+                ds.Rows, ds.Columns
+            )
+    except Exception:
+        pass
+
+    raise ValueError(
+        f"Cannot decode pixel data for SOP {getattr(ds, 'SOPInstanceUID', '?')}. "
+        "Install codec plugins: pip install pylibjpeg pylibjpeg-libjpeg "
+        "pylibjpeg-openjpeg  or  pip install python-gdcm"
+    )
+
+
 @st.cache_data(show_spinner=False)
 def load_ct_volume(files: tuple[str, ...]):
     """
     Load sorted CT series → HU volume.
-    Returns: volume (rows, cols, slices), slices, z_positions, spacing, origin
+    Returns: volume (rows, cols, slices), slices, z_positions, spacing, origin, direction
     """
-    slices = [pydicom.dcmread(f) for f in files]
-    slices.sort(key=lambda x: float(x.ImagePositionPatient[2]))
+    raw_slices = [pydicom.dcmread(f) for f in files]
+    raw_slices.sort(key=lambda x: float(x.ImagePositionPatient[2]))
 
-    imgs, zs = [], []
-    for s in slices:
-        img = s.pixel_array.astype(np.float32)
+    imgs, zs, slices = [], [], []
+    decode_errors = 0
+    for s in raw_slices:
+        try:
+            img = _decode_pixel_array(s)
+        except Exception as exc:
+            decode_errors += 1
+            log.warning("Skipping slice %s: %s", getattr(s, "SOPInstanceUID", "?"), exc)
+            continue
         slope = float(getattr(s, "RescaleSlope", 1.0))
         intercept = float(getattr(s, "RescaleIntercept", 0.0))
         imgs.append(img * slope + intercept)
         zs.append(float(s.ImagePositionPatient[2]))
+        slices.append(s)
+
+    if decode_errors:
+        log.warning("%d slice(s) could not be decoded and were skipped.", decode_errors)
+
+    if not imgs:
+        raise ValueError(
+            "No slices could be decoded. The DICOM files may use a compressed "
+            "transfer syntax that requires additional codec plugins.\n"
+            "Install them with:\n"
+            "  pip install pylibjpeg pylibjpeg-libjpeg pylibjpeg-openjpeg\n"
+            "or:\n"
+            "  pip install python-gdcm"
+        )
 
     volume = np.stack(imgs, axis=-1)
     z_positions = np.array(zs)
