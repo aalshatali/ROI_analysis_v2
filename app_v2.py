@@ -504,9 +504,34 @@ def load_ct_volume(files: tuple[str, ...]):
     return volume, slices, z_positions, spacing, origin, direction
 
 
-def build_roi_mask(rt_path: str, roi_name: str, volume_shape, z_positions, spacing, origin,
-                   z_tol: float = 3.0) -> np.ndarray:
-    """Convert RTSTRUCT contours → boolean voxel mask."""
+def build_roi_mask(
+    rt_path: str,
+    roi_name: str,
+    volume_shape: tuple,
+    z_positions: np.ndarray,
+    spacing: tuple,
+    origin: np.ndarray,
+    z_tol: float = 3.0,
+) -> np.ndarray:
+    """
+    Convert RTSTRUCT contours for roi_name into a boolean voxel mask.
+
+    Slice matching strategy (robust to Z-origin mismatches):
+    ─────────────────────────────────────────────────────────
+    1. PRIMARY — physical Z match within z_tol mm.
+       Works when DICOM headers are consistent.
+    2. FALLBACK — rank-based match.
+       When no contour Z is within z_tol of any image slice Z
+       (e.g. the registration transform was applied to pixel data
+       but ImagePositionPatient was NOT updated), we sort contours
+       by their own Z order and map them onto the image slices by
+       rank (1st contour → 1st slice it would fall on by index
+       proportion).  This is safe because the contours are already
+       ordered anatomically.
+
+    XY projection always uses the image's own pixel spacing and
+    XY origin so it is unaffected by Z inconsistency.
+    """
     rt = pydicom.dcmread(rt_path)
     roi_map = {r.ROIName: r.ROINumber for r in rt.StructureSetROISequence}
     roi_num = roi_map.get(roi_name)
@@ -526,14 +551,64 @@ def build_roi_mask(rt_path: str, roi_name: str, volume_shape, z_positions, spaci
 
     row_sp, col_sp, _ = spacing
     x0, y0 = origin[0], origin[1]
+    n_slices = volume_shape[2]
 
+    # Collect all contours sorted by their own Z coordinate
+    contour_list = []
     for contour in roi_contours.ContourSequence:
         pts = np.array(contour.ContourData).reshape(-1, 3)
+        contour_list.append(pts)
+    contour_list.sort(key=lambda p: p[0, 2])
+
+    # ── PRIMARY: physical Z matching ──
+    matched_physically = 0
+    for pts in contour_list:
         z = pts[0, 2]
         dists = np.abs(z_positions - z)
         si = int(np.argmin(dists))
-        if dists[si] > z_tol:
-            continue
+        if dists[si] <= z_tol:
+            rows = (pts[:, 1] - y0) / row_sp
+            cols = (pts[:, 0] - x0) / col_sp
+            rr, cc = polygon(rows, cols, shape=volume_shape[:2])
+            mask[rr, cc, si] = True
+            matched_physically += 1
+
+    if matched_physically > 0:
+        return mask
+
+    # ── FALLBACK: rank-based Z mapping ──
+    # The contour Z values live in a different coordinate frame than the
+    # image Z values (registration applied to pixels but not to headers).
+    # Map contour rank → image slice index proportionally.
+    log.warning(
+        "ROI '%s': no contours matched physically (z_tol=%.1f mm). "
+        "Using rank-based slice mapping as fallback.",
+        roi_name, z_tol,
+    )
+    n_contours = len(contour_list)
+    if n_contours == 0:
+        return mask
+
+    # Map each contour by rank to an evenly-spaced position in the slice range.
+    # Use the image's own Z range as the target span.
+    z_img_min = float(z_positions.min())
+    z_img_max = float(z_positions.max())
+
+    # Get the contour Z span
+    c_zs = np.array([pts[0, 2] for pts in contour_list])
+    c_z_min, c_z_max = float(c_zs.min()), float(c_zs.max())
+    c_z_span = c_z_max - c_z_min if c_z_max != c_z_min else 1.0
+
+    for pts in contour_list:
+        c_z = pts[0, 2]
+        # Normalise contour Z to [0,1] within the contour Z span
+        t = (c_z - c_z_min) / c_z_span
+        # Map to image Z span
+        target_z = z_img_min + t * (z_img_max - z_img_min)
+        dists = np.abs(z_positions - target_z)
+        si = int(np.argmin(dists))
+        si = max(0, min(si, n_slices - 1))
+
         rows = (pts[:, 1] - y0) / row_sp
         cols = (pts[:, 0] - x0) / col_sp
         rr, cc = polygon(rows, cols, shape=volume_shape[:2])
@@ -769,46 +844,44 @@ if zip_ct and zip_pcct:
 
             for ct_sl, pcct_sl in slice_pairs:
                 if needs_inplane_resample:
-                    # Wrap single PCCT slice as a 2D SimpleITK image
+                    # In-plane resample: pixel spacing differs between scanners.
+                    # We do NOT use XY origins because those may also be
+                    # inconsistent after registration. Instead we set both
+                    # images to origin (0,0) so the resampler treats them as
+                    # purely grid-size / spacing transforms with no translation.
                     pcct_slice_sitk = sitk.GetImageFromArray(
                         pcct_vol[:, :, pcct_sl].astype(np.float32)
                     )
                     pcct_slice_sitk.SetSpacing(
                         (float(pcct_spacing[1]), float(pcct_spacing[0]))
                     )
-                    pcct_slice_sitk.SetOrigin(
-                        (float(pcct_origin[0]), float(pcct_origin[1]))
-                    )
-                    # Reference CT slice grid
+                    pcct_slice_sitk.SetOrigin((0.0, 0.0))
+
                     ct_ref_sitk = sitk.GetImageFromArray(
                         ct_vol[:, :, ct_sl].astype(np.float32)
                     )
                     ct_ref_sitk.SetSpacing(
                         (float(ct_spacing[1]), float(ct_spacing[0]))
                     )
-                    ct_ref_sitk.SetOrigin(
-                        (float(ct_origin[0]), float(ct_origin[1]))
-                    )
+                    ct_ref_sitk.SetOrigin((0.0, 0.0))
+
                     resampler_2d = sitk.ResampleImageFilter()
                     resampler_2d.SetReferenceImage(ct_ref_sitk)
                     resampler_2d.SetInterpolator(sitk.sitkLinear)
                     resampler_2d.SetTransform(sitk.Transform(2, sitk.sitkIdentity))
                     resampler_2d.SetDefaultPixelValue(-1024.0)
-                    pcct_resampled_2d = sitk.GetArrayFromImage(
+                    pcct_vol_r[:, :, ct_sl] = sitk.GetArrayFromImage(
                         resampler_2d.Execute(pcct_slice_sitk)
                     )
-                    pcct_vol_r[:, :, ct_sl] = pcct_resampled_2d
 
-                    # Resample PCCT mask slice
                     pcct_mask_sitk_2d = sitk.GetImageFromArray(
                         mask_pcct[:, :, pcct_sl].astype(np.float32)
                     )
                     pcct_mask_sitk_2d.SetSpacing(
                         (float(pcct_spacing[1]), float(pcct_spacing[0]))
                     )
-                    pcct_mask_sitk_2d.SetOrigin(
-                        (float(pcct_origin[0]), float(pcct_origin[1]))
-                    )
+                    pcct_mask_sitk_2d.SetOrigin((0.0, 0.0))
+
                     resampler_nn2d = sitk.ResampleImageFilter()
                     resampler_nn2d.SetReferenceImage(ct_ref_sitk)
                     resampler_nn2d.SetInterpolator(sitk.sitkNearestNeighbor)
@@ -818,7 +891,7 @@ if zip_ct and zip_pcct:
                         resampler_nn2d.Execute(pcct_mask_sitk_2d)
                     ).astype(bool)
                 else:
-                    # Same grid — just copy
+                    # Same grid size and spacing — direct copy
                     pcct_vol_r[:, :, ct_sl]  = pcct_vol[:, :, pcct_sl]
                     mask_pcct_r[:, :, ct_sl] = mask_pcct[:, :, pcct_sl]
 
@@ -828,7 +901,8 @@ if zip_ct and zip_pcct:
             combined_mask_pre = mask_ct & mask_pcct_r
             n_intersection = int(combined_mask_pre.sum())
 
-            with st.expander("🔍 Mask diagnostics (expand to debug)", expanded=False):
+            diag_should_expand = (n_ct_mask_raw == 0 or n_pcct_mask_raw == 0 or len(slice_pairs) == 0)
+            with st.expander("🔍 Mask diagnostics (expand to debug)", expanded=diag_should_expand):
                 st.markdown(
                     f"| Step | Voxels |\n|---|---|\n"
                     f"| CT mask (native grid) | `{n_ct_mask:,}` |\n"
@@ -1192,6 +1266,8 @@ if zip_ct and zip_pcct:
                     s_means, s_diffs = [], []
                     for sli in np.unique(sv_z):
                         m = sv_z == sli
+                        if m.sum() == 0:
+                            continue
                         s_means.append(float(np.mean((sv_ct[m] + sv_pcct[m]) / 2)))
                         s_diffs.append(float(np.mean(sv_ct[m] - sv_pcct[m])))
                     s_means = np.array(s_means)
@@ -1201,6 +1277,14 @@ if zip_ct and zip_pcct:
                     idx_s = np.random.choice(len(sv_ct), n_s, replace=False)
                     s_means = (sv_ct[idx_s] + sv_pcct[idx_s]) / 2
                     s_diffs = sv_ct[idx_s] - sv_pcct[idx_s]
+
+                if len(s_diffs) < 2:
+                    ax_s.text(0.5, 0.5, f"Too few points\n(n={len(s_diffs)})",
+                              ha="center", va="center", color=PLOT_FG,
+                              transform=ax_s.transAxes, fontsize=9)
+                    ax_s.set_title(sname, fontsize=9)
+                    apply_dark_style(ax_s, fig_sba)
+                    continue
 
                 s_md = float(np.mean(s_diffs))
                 s_sd = float(np.std(s_diffs))
